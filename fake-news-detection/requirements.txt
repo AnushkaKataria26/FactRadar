@@ -9,3 +9,9 @@ pydantic
 mlflow
 pytest
 httpx
+
+# Transformer dependencies
+torch
+transformers
+datasets
+accelerate
