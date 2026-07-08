@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-07-07T11:44:15+00:00",
+  "model_name": "distilbert-base-uncased",
+  "batch_size_used": 16,
+  "training_time_seconds": 4407.18114066124,
+  "device": "cuda",
+  "final_val_accuracy": 0.995997911954063,
+  "final_val_f1_macro": 0.9959635826173235,
+  "final_val_precision_macro": 0.9959796675311781,
+  "final_val_recall_macro": 0.9959475595703553
+}
