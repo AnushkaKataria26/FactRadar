@@ -61,3 +61,18 @@ class ModelVersionResponse(BaseModel):
     model_version: str
     trained_at: str
     metrics: dict
+
+
+class TokenWeight(BaseModel):
+    token: str
+    weight: float
+
+
+class ExplainResponse(BaseModel):
+    """Schema for POST /explain response body."""
+
+    predicted_label: Literal["fake", "real"]
+    confidence: float
+    top_contributing_tokens: list[TokenWeight]
+    model_version: str
+    warning: Optional[str] = None

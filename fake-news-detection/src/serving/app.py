@@ -18,6 +18,7 @@ import traceback
 from pathlib import Path
 
 import joblib
+import asyncio
 from fastapi import FastAPI, HTTPException
 
 from src.preprocessing.clean_text import clean_text
@@ -26,6 +27,8 @@ from src.serving.schemas import (
     ModelVersionResponse,
     PredictRequest,
     PredictResponse,
+    ExplainResponse,
+    TokenWeight,
 )
 
 # ---------------------------------------------------------------------------
@@ -158,6 +161,78 @@ async def predict(request: PredictRequest) -> PredictResponse:
         raise HTTPException(
             status_code=500,
             detail="Internal server error during prediction.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# POST /explain
+# ---------------------------------------------------------------------------
+@app.post("/explain", response_model=ExplainResponse)
+async def explain(request: PredictRequest) -> ExplainResponse:
+    """Explain a single article's prediction using LIME.
+    
+    Returns HTTP 504 if the explanation takes longer than 10 seconds.
+    """
+    if not model_loaded:
+        raise HTTPException(
+            status_code=503,
+            detail="Model is not loaded. Service is degraded.",
+        )
+        
+    try:
+        from src.preprocessing.clean_text import clean_text
+        cleaned = clean_text(request.text)
+        if not cleaned:
+            raise HTTPException(
+                status_code=422,
+                detail="Input contains no usable text content after preprocessing.",
+            )
+            
+        warning = None
+        token_count = len(cleaned.split())
+        if token_count < _MIN_TOKEN_COUNT:
+            warning = "low_confidence_ood"
+            
+        probabilities = _pipeline.predict_proba([cleaned])[0]
+        classes = _pipeline.classes_
+        predicted_class_idx = probabilities.argmax()
+        confidence = float(probabilities[predicted_class_idx])
+        predicted_class = int(classes[predicted_class_idx])
+        predicted_label = "fake" if predicted_class == 1 else "real"
+        
+        from src.serving.explain_lime import explain_instance
+        
+        try:
+            explanation_list = await asyncio.wait_for(
+                asyncio.to_thread(explain_instance, request.text, 10),
+                timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="Explanation computation exceeded the 10 second timeout."
+            )
+            
+        top_tokens = [TokenWeight(token=k, weight=v) for k, v in explanation_list]
+        
+        return ExplainResponse(
+            predicted_label=predicted_label,
+            confidence=round(confidence, 6),
+            top_contributing_tokens=top_tokens,
+            model_version=_MODEL_VERSION,
+            warning=warning,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Unexpected error during explanation: %s\n%s",
+            exc,
+            traceback.format_exc(),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error during explanation computation.",
         )
 
 
