@@ -18,3 +18,4 @@ accelerate
 
 # Explainability
 lime
+streamlit

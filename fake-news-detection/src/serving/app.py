@@ -29,6 +29,10 @@ from src.serving.schemas import (
     PredictResponse,
     ExplainResponse,
     TokenWeight,
+    BatchPredictRequest,
+    BatchPredictResponse,
+    BatchPredictResult,
+    BatchPredictSummary,
 )
 
 # ---------------------------------------------------------------------------
@@ -281,6 +285,107 @@ async def explain(request: PredictRequest) -> ExplainResponse:
         raise HTTPException(
             status_code=500,
             detail="Internal server error during explanation computation.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# POST /predict/batch
+# ---------------------------------------------------------------------------
+@app.post("/predict/batch", response_model=BatchPredictResponse)
+async def predict_batch(request: BatchPredictRequest) -> BatchPredictResponse:
+    """Classify a batch of articles as fake or real.
+
+    Edge cases handled:
+    - Model not loaded → 503
+    - Catastrophic failure → 503
+    """
+    if not model_loaded:
+        raise HTTPException(
+            status_code=503,
+            detail="Model is not loaded. Service is degraded.",
+        )
+
+    try:
+        import time
+        from src.serving.log_inference import log_prediction
+        start_time = time.time()
+        
+        warnings_summary = set()
+        seen_ids = set()
+        
+        # Prepare structures
+        valid_indices = []
+        texts_to_predict = []
+        results = [None] * len(request.articles)
+        
+        for i, article in enumerate(request.articles):
+            if article.article_id in seen_ids:
+                warnings_summary.add("Duplicate article_id detected.")
+            seen_ids.add(article.article_id)
+            
+            cleaned = clean_text(article.text)
+            if not cleaned:
+                results[i] = BatchPredictResult(
+                    article_id=article.article_id,
+                    predicted_label=None,
+                    confidence=None,
+                    warning="invalid_input"
+                )
+            else:
+                warning = None
+                if len(cleaned.split()) < _MIN_TOKEN_COUNT:
+                    warning = "low_confidence_ood"
+                    
+                valid_indices.append(i)
+                texts_to_predict.append(cleaned)
+                results[i] = warning  # temporarily store warning
+                
+        if texts_to_predict:
+            probabilities = unified_predict_proba(texts_to_predict)
+            
+            for idx, batch_idx in enumerate(valid_indices):
+                probs = probabilities[idx]
+                predicted_class_idx = probs.argmax()
+                confidence = float(probs[predicted_class_idx])
+                predicted_label = "fake" if int(predicted_class_idx) == 1 else "real"
+                
+                article = request.articles[batch_idx]
+                warning = results[batch_idx]  # retrieve stored warning
+                
+                results[batch_idx] = BatchPredictResult(
+                    article_id=article.article_id,
+                    predicted_label=predicted_label,
+                    confidence=round(confidence, 6),
+                    warning=warning
+                )
+                
+                # Log to DB
+                log_prediction(_MODEL_VERSION, article.text, predicted_label, confidence, 0.0)
+                
+        total_processed = len(valid_indices)
+        total_failed = len(request.articles) - total_processed
+        latency_ms = (time.time() - start_time) * 1000
+        
+        summary = BatchPredictSummary(
+            total_processed=total_processed,
+            total_failed=total_failed,
+            processing_time_ms=round(latency_ms, 2),
+            warnings=list(warnings_summary) if warnings_summary else None
+        )
+        
+        return BatchPredictResponse(results=results, summary=summary)
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Unexpected error during batch prediction: %s\n%s",
+            exc,
+            traceback.format_exc(),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Internal server error during batch prediction.",
         )
 
 

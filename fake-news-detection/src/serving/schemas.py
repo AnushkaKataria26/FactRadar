@@ -48,6 +48,49 @@ class PredictResponse(BaseModel):
     warning: Optional[str] = None
 
 
+class BatchPredictArticle(BaseModel):
+    """Individual article within a batch request."""
+    article_id: str
+    title: Optional[str] = None
+    text: str
+
+
+class BatchPredictRequest(BaseModel):
+    """Schema for POST /predict/batch request body."""
+    articles: list[BatchPredictArticle]
+
+    @field_validator("articles")
+    @classmethod
+    def validate_articles_length(cls, v: list[BatchPredictArticle]) -> list[BatchPredictArticle]:
+        if not v:
+            raise ValueError("articles list cannot be empty")
+        if len(v) > 500:
+            raise ValueError("batch size exceeds maximum limit of 500 articles")
+        return v
+
+
+class BatchPredictResult(BaseModel):
+    """Prediction result for a single article in a batch."""
+    article_id: str
+    predicted_label: Optional[Literal["fake", "real"]] = None
+    confidence: Optional[float] = None
+    warning: Optional[str] = None
+
+
+class BatchPredictSummary(BaseModel):
+    """Summary statistics for a batch prediction."""
+    total_processed: int
+    total_failed: int
+    processing_time_ms: float
+    warnings: Optional[list[str]] = None
+
+
+class BatchPredictResponse(BaseModel):
+    """Schema for POST /predict/batch response body."""
+    results: list[BatchPredictResult]
+    summary: BatchPredictSummary
+
+
 class HealthResponse(BaseModel):
     """Schema for GET /health response body."""
 
