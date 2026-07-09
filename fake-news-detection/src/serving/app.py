@@ -52,35 +52,78 @@ _MIN_TOKEN_COUNT = 3
 # ---------------------------------------------------------------------------
 # Load model and metrics at module level (once, not per request)
 # ---------------------------------------------------------------------------
+import mlflow
+import os
+
+os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
+mlflow.set_tracking_uri("file:./mlruns")
+
+# ---------------------------------------------------------------------------
+# Load model from MLflow Registry
+# ---------------------------------------------------------------------------
 _pipeline = None
-_metrics: dict | None = None
-model_loaded: bool = False
+_metrics = None
+model_loaded = False
+_mtype = "sklearn"
 
-try:
-    _pipeline = joblib.load(_MODEL_PATH)
-    logger.info("Model loaded successfully from %s", _MODEL_PATH)
-except Exception as exc:
-    logger.error(
-        "Failed to load model from %s: %s\n%s",
-        _MODEL_PATH,
-        exc,
-        traceback.format_exc(),
-    )
+def load_model():
+    global _pipeline, _metrics, model_loaded, _mtype, _MODEL_VERSION
+    client = mlflow.tracking.MlflowClient()
+    try:
+        model_name = "sourcetrace-classifier"
+        mv = client.get_model_version_by_alias(model_name, "Production")
+        model_uri = f"models:/{model_name}@Production"
+        
+        # Determine model flavor
+        run = client.get_run(mv.run_id)
+        if "transformer" in run.data.tags.get("mlflow.runName", "") or "transformer" in mv.source:
+            _pipeline = mlflow.transformers.load_model(model_uri)
+            _mtype = "transformers"
+        else:
+            _pipeline = mlflow.sklearn.load_model(model_uri)
+            _mtype = "sklearn"
+            
+        _MODEL_VERSION = f"{model_name}-v{mv.version}"
+        model_loaded = True
+        logger.info(f"Loaded Production model {_MODEL_VERSION} ({_mtype}) from MLflow registry.")
+        
+        # Load metrics dynamically from run if possible
+        _metrics = run.data.metrics
+        _metrics["timestamp"] = run.info.start_time
+    except Exception as exc:
+        logger.warning(f"Failed to load from MLflow registry: {exc}. Falling back to local joblib.")
+        try:
+            _pipeline = joblib.load(_MODEL_PATH)
+            _mtype = "sklearn"
+            model_loaded = True
+            with open(_METRICS_PATH, "r") as f:
+                _metrics = json.load(f)
+            logger.info("Fallback loaded successfully from %s", _MODEL_PATH)
+        except Exception as e:
+            logger.error(f"Fallback loading failed: {e}")
+            model_loaded = False
 
-try:
-    with open(_METRICS_PATH, "r") as f:
-        _metrics = json.load(f)
-    logger.info("Metrics loaded successfully from %s", _METRICS_PATH)
-except Exception as exc:
-    logger.error(
-        "Failed to load metrics from %s: %s\n%s",
-        _METRICS_PATH,
-        exc,
-        traceback.format_exc(),
-    )
+load_model()
 
-# Model is "loaded" only if both the pipeline and metrics loaded successfully
-model_loaded = _pipeline is not None and _metrics is not None
+def unified_predict_proba(texts):
+    """Wrapper to provide predict_proba interface for LIME, regardless of underlying model type."""
+    if _mtype == "sklearn":
+        return _pipeline.predict_proba(texts)
+    else:
+        # Transformers pipeline
+        import numpy as np
+        res = _pipeline(texts, truncation=True, max_length=512, top_k=None)
+        probs = []
+        for r in res:
+            p0, p1 = 0.0, 0.0
+            for score_dict in r:
+                lbl = str(score_dict['label'])
+                if lbl in ['LABEL_0', '0', 'real']:
+                    p0 = score_dict['score']
+                else:
+                    p1 = score_dict['score']
+            probs.append([p0, p1])
+        return np.array(probs)
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -131,16 +174,22 @@ async def predict(request: PredictRequest) -> PredictResponse:
             warning = "low_confidence_ood"
 
         # 5. Run prediction
-        #    sklearn pipeline expects a list/array of strings (2D-like input).
-        probabilities = _pipeline.predict_proba([cleaned])[0]
-        # classes_ gives the label order: typically [0, 1] where 0=real, 1=fake
-        classes = _pipeline.classes_
+        from src.serving.log_inference import log_prediction
+        import time
+        start_time = time.time()
+        
+        probabilities = unified_predict_proba([cleaned])[0]
         predicted_class_idx = probabilities.argmax()
         confidence = float(probabilities[predicted_class_idx])
-        predicted_class = int(classes[predicted_class_idx])
+        predicted_class = int(predicted_class_idx)
 
         # Map numeric label to string: 0 → "real", 1 → "fake"
         predicted_label = "fake" if predicted_class == 1 else "real"
+        
+        latency_ms = (time.time() - start_time) * 1000
+        
+        # Log to DB
+        log_prediction(_MODEL_VERSION, request.text, predicted_label, confidence, latency_ms)
 
         return PredictResponse(
             predicted_label=predicted_label,
@@ -193,18 +242,17 @@ async def explain(request: PredictRequest) -> ExplainResponse:
         if token_count < _MIN_TOKEN_COUNT:
             warning = "low_confidence_ood"
             
-        probabilities = _pipeline.predict_proba([cleaned])[0]
-        classes = _pipeline.classes_
+        probabilities = unified_predict_proba([cleaned])[0]
         predicted_class_idx = probabilities.argmax()
         confidence = float(probabilities[predicted_class_idx])
-        predicted_class = int(classes[predicted_class_idx])
+        predicted_class = int(predicted_class_idx)
         predicted_label = "fake" if predicted_class == 1 else "real"
         
         from src.serving.explain_lime import explain_instance
         
         try:
             explanation_list = await asyncio.wait_for(
-                asyncio.to_thread(explain_instance, request.text, 10),
+                asyncio.to_thread(explain_instance, request.text, unified_predict_proba, 10),
                 timeout=10.0
             )
         except asyncio.TimeoutError:

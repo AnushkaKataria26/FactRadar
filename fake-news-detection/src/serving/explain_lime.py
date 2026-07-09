@@ -1,38 +1,27 @@
 import logging
 from pathlib import Path
-import joblib
-
 from lime.lime_text import LimeTextExplainer
 from src.preprocessing.clean_text import clean_text
 
 logger = logging.getLogger(__name__)
 
-_MODEL_PATH = Path("models/v0.1_baseline.joblib")
+# Instantiate explainer once
+_explainer = LimeTextExplainer(class_names=["real", "fake"])
 
-_pipeline = None
-_explainer = None
-
-try:
-    _pipeline = joblib.load(_MODEL_PATH)
-    logger.info("Model loaded successfully in explainer from %s", _MODEL_PATH)
-    # The classes in the pipeline are typically [0, 1] for real, fake
-    _explainer = LimeTextExplainer(class_names=["real", "fake"])
-except Exception as exc:
-    logger.error("Failed to load model or instantiate explainer: %s", exc)
-
-def explain_instance(text: str, num_features: int = 10) -> list[tuple[str, float]]:
+def explain_instance(text: str, predict_fn, num_features: int = 10) -> list[tuple[str, float]]:
     """
     Explain a single instance using LIME.
     
     Args:
         text (str): Raw input text.
+        predict_fn (callable): Function that takes list of strings and returns probabilities.
         num_features (int): Maximum number of features to include in explanation.
         
     Returns:
         A list of (token, weight) tuples sorted by absolute weight descending.
     """
-    if _pipeline is None or _explainer is None:
-        raise RuntimeError("Explainer or pipeline is not loaded.")
+    if _explainer is None:
+        raise RuntimeError("Explainer is not loaded.")
         
     cleaned_text = clean_text(text)
     
@@ -42,8 +31,9 @@ def explain_instance(text: str, num_features: int = 10) -> list[tuple[str, float
     # Generate explanation
     exp = _explainer.explain_instance(
         cleaned_text, 
-        _pipeline.predict_proba, 
-        num_features=num_features
+        predict_fn, 
+        num_features=num_features,
+        num_samples=10
     )
     
     # exp.as_list() returns a list of (word, weight) for the predicted class
